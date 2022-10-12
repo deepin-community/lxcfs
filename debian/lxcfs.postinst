@@ -1,0 +1,44 @@
+#!/bin/sh
+
+set -e
+
+# This script can be called in the following ways:
+#
+# After the package was installed:
+#       <postinst> configure <old-version>
+#
+#
+# If prerm fails during upgrade or fails on failed upgrade:
+#       <old-postinst> abort-upgrade <new-version>
+#
+# If prerm fails during deconfiguration of a package:
+#       <postinst> abort-deconfigure in-favour <new-package> <version>
+#                  removing <old-package> <version>
+#
+# If prerm fails during replacement due to conflict:
+#       <postinst> abort-remove in-favour <new-package> <version>
+
+case "$1" in
+    configure)
+        # We cannot restart lxcfs itself because containers will become
+        # unable to read /proc/uptime etc.
+        if [ -f /run/lxcfs.pid ]; then
+            # send it a USR1 signal to reload the new liblxcfs.
+            kill -USR1 `cat /run/lxcfs.pid` || true
+        fi
+        # lxcfs was not running, so just wait for systemd to start it.
+    ;;
+
+esac
+
+#DEBHELPER#
+
+case "$1" in
+    configure|abort-upgrade|abort-deconfigure|abort-remove)
+        if deb-systemd-helper --quiet is-enabled 'lxcfs.service'; then
+            deb-systemd-helper start 'lxcfs.service' > /dev/null
+        fi
+    ;;
+esac
+
+exit 0
