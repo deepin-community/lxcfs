@@ -1,0 +1,6 @@
+#!/usr/bin/env /usr/lib/runit/invoke-run
+#Copyright: 2025 Martin Steigerwald <martin@lichtvoll.de>
+#License: LGPL-2.1+
+
+exec 2>&1
+exec choom -n -1000 -- /usr/bin/lxcfs -f /var/lib/lxcfs

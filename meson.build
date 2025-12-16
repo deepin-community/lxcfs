@@ -4,7 +4,7 @@
 project(
     'lxcfs',
     'c',
-    version: '5.0.0',
+    version: '6.0.4',
     license: 'LGPLv2+',
     default_options: [
         'b_colorout=always',
@@ -52,11 +52,12 @@ datadir = join_paths(prefixdir, get_option('datadir'))
 
 lxcfssharedir = join_paths(datadir, 'lxcfs')
 lxcconfdir = join_paths(datadir, 'lxc/config/common.conf.d')
+lxcmandir = join_paths(datadir, 'man')
 
 conf.set_quoted('BINDIR', bindir)
 conf.set_quoted('LIBDIR', libdir)
 conf.set_quoted('LOCALSTATEDIR', localstatedir)
-conf.set_quoted('RUNTIME_PATH', runtimepath)
+conf.set_quoted('DEFAULT_RUNTIME_PATH', runtimepath)
 conf.set_quoted('SYSCONFDIR', sysconfdir)
 
 conf.set_quoted('LXCCONFDIR', lxcconfdir)
@@ -68,7 +69,7 @@ conf.set_quoted('LXCFSTARGETDIR', join_paths(localstatedir, 'lib/lxcfs'))
 # Custom configuration.
 init_script = get_option('init-script')
 want_tests = get_option('tests')
-
+want_docs = get_option('docs')
 
 # Build flags.
 possible_cc_flags = [
@@ -144,16 +145,31 @@ foreach ident: [
     conf.set10('HAVE_' + ident[0].to_upper(), have)
 endforeach
 
-libfuse = dependency('fuse3', required: false)
-if libfuse.found()
-    conf.set10('HAVE_FUSE3', true)
-    conf.set('FUSE_USE_VERSION', 30)
-else
+fuse_version = get_option('fuse-version')
+if fuse_version == '3' or fuse_version == 'auto'
+    libfuse = dependency('fuse3', required: false)
+    if libfuse.found()
+        conf.set10('HAVE_FUSE3', true)
+        conf.set('FUSE_USE_VERSION', 35)
+        if libfuse.version().version_compare('>=3.10.3')
+            conf.set10('HAVE_FUSE_RETURNS_DT_TYPE', true)
+        else
+            conf.set10('HAVE_FUSE_RETURNS_DT_TYPE', false)
+        endif
+    endif
+endif
+
+if fuse_version == '2' or (not libfuse.found() and fuse_version == 'auto')
     libfuse = dependency('fuse', version: '>= 2.6')
     if libfuse.found()
         conf.set10('HAVE_FUSE', true)
         conf.set('FUSE_USE_VERSION', 26)
+        conf.set10('HAVE_FUSE_RETURNS_DT_TYPE', true)
     endif
+endif
+
+if not libfuse.found()
+	error('no usable fuse version found')
 endif
 
 libdl = cc.find_library('dl')
@@ -166,9 +182,8 @@ config_include = include_directories('.')
 add_project_arguments('-include', 'config.h', language: 'c')
 
 # Binary.
-lxcfs_sources = files('src/lxcfs.c')
-public_programs = []
-public_programs += executable(
+lxcfs_sources = files('src/lxcfs.c', 'src/utils.c')
+lxcfs = executable(
     'lxcfs',
     lxcfs_sources,
     dependencies: [
@@ -187,8 +202,6 @@ liblxcfs_sources = files(
     'src/cgroups/cgfsng.c',
     'src/cgroups/cgroup.c',
     'src/cgroups/cgroup.h',
-    'src/cgroups/cgroup2_devices.c',
-    'src/cgroups/cgroup2_devices.h',
     'src/cgroups/cgroup_utils.c',
     'src/cgroups/cgroup_utils.h',
     'src/cgroup_fuse.c',
@@ -251,6 +264,24 @@ lxcfs_spec = custom_target(
         '@OUTPUT@',
     ])
 
+# Man pages
+if want_docs == true
+    help2man = find_program('help2man')
+    help2man_opts = [
+       '--name="System virtualization filesystem for containers"',
+       '--no-discard-stderr',
+       '--section=1',
+       '--opt-include=docs/lxcfs.man.add',
+       '--no-info',
+    ]
+    custom_target('lxcfs.1',
+        output: 'lxcfs.1',
+        command: [help2man, help2man_opts, '--output=@OUTPUT@', lxcfs],
+        install: true,
+        install_dir: join_paths(lxcmandir, 'man1'))
+endif
+
+
 # Include sub-directories.
 subdir('config/init')
 subdir('share')
@@ -273,7 +304,8 @@ status = [
     'lxcfs shared directory:	@0@'.format(lxcfssharedir),
     'lxcfs build root directory:	@0@'.format(project_build_root),
     'lxcfs source root directory:	@0@'.format(project_source_root),
-    'init system:			@0@'.format(init_script),
+    'init system(s):		@0@'.format(init_script),
     'tests:				@0@'.format(want_tests),
+    'documentation:			@0@'.format(want_docs),
 ]
 message('\n         '.join(status))

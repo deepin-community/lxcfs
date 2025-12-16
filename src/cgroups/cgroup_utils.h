@@ -61,14 +61,6 @@ extern bool dir_exists(const char *path);
 extern int safe_mount(const char *src, const char *dest, const char *fstype,
 		      unsigned long flags, const void *data, const char *rootfs);
 
-#if !HAVE_STRLCPY
-extern size_t strlcpy(char *, const char *, size_t);
-#endif
-
-#if !HAVE_STRLCAT
-extern size_t strlcat(char *d, const char *s, size_t n);
-#endif
-
 extern FILE *fopen_cloexec(const char *path, const char *mode);
 extern void append_line(char **dest, size_t oldlen, char *new, size_t newlen);
 extern char *read_file(const char *fnam);
@@ -80,6 +72,7 @@ extern char *cg_hybrid_get_current_cgroup(char *basecginfo,
 extern char *cg_legacy_get_current_cgroup(pid_t pid, const char *controller);
 extern bool mkdir_p(const char *dir, mode_t mode);
 extern bool is_cgroup_fd(int fd);
+extern bool is_cgroup2_fd(int fd);
 
 static inline int openat_safe(int fd, const char *path)
 {

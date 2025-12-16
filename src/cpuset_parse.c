@@ -18,6 +18,9 @@ static char *cpuset_nexttok(const char *c)
 {
 	char *r;
 
+	if (!strlen(c))
+		return NULL;
+
 	r = strchr(c + 1, ',');
 	return r ? (r + 1) : NULL;
 }
@@ -36,6 +39,9 @@ static int cpuset_getrange(const char *c, int *a, int *b)
  */
 bool cpu_in_cpuset(int cpu, const char *cpuset)
 {
+	if (!strlen(cpuset))
+		return false;
+
 	for (const char *c = cpuset; c; c = cpuset_nexttok(c)) {
 		int a, b, ret;
 

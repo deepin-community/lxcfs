@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-if init_script == 'systemd'
+if 'systemd' in init_script
+    systemd = dependency('systemd')
+    systemd_system_unit_dir = systemd.get_pkgconfig_variable('systemdsystemunitdir')
     systemd_service = custom_target(
         'lxcfs.service',
         input: 'systemd/lxcfs.service.in',
@@ -12,12 +14,17 @@ if init_script == 'systemd'
             '@OUTPUT@',
         ],
         install: true,
-        install_dir: '/lib/systemd/system')
+        install_dir: systemd_system_unit_dir)
+endif
 
-elif init_script == 'upstart'
+if 'upstart' in init_script
         install_data('upstart/lxcfs.conf', install_dir: join_paths(sysconfdir, 'init'))
-elif init_script == 'openrc'
-        install_data('sysvinit/lxcfs', install_dir: join_paths(sysconfdir, 'rc.d/init.d/lxcfs'))
-elif init_script == 'sysvinit'
-        install_data('sysvinit/lxcfs', install_dir: join_paths(sysconfdir, 'rc.d/init.d/lxcfs'))
+endif
+
+if 'openrc' in init_script
+        install_data('sysvinit/lxcfs', install_dir: join_paths(sysconfdir, 'rc.d/init.d'))
+endif
+
+if 'sysvinit' in init_script
+        install_data('sysvinit/lxcfs', install_dir: join_paths(sysconfdir, 'init.d'))
 endif

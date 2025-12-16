@@ -3,15 +3,18 @@ Section: admin
 Priority: optional
 Maintainer: pkg-lxc <pkg-lxc-devel@lists.alioth.debian.org>
 Uploaders: Evgeni Golov <evgeni@debian.org>,
-           Pierre-Elliott Bécue <peb@debian.org>
+           Pierre-Elliott Bécue <peb@debian.org>,
+           Mathias Gibbens <gibmat@debian.org>
 Build-Depends: debhelper-compat (= 13),
                help2man,
                libfuse3-dev,
                linux-libc-dev,
                meson,
-               pkg-config,
-               python3-jinja2
-Standards-Version: 4.6.0
+               pkgconf,
+               python3-jinja2,
+               systemd-dev,
+               dh-sequence-runit
+Standards-Version: 4.7.2
 Homepage: https://linuxcontainers.org
 Vcs-Git: https://salsa.debian.org/lxc-team/lxcfs.git
 Vcs-Browser: https://salsa.debian.org/lxc-team/lxcfs
@@ -19,8 +22,9 @@ Rules-Requires-Root: no
 
 Package: lxcfs
 Architecture: linux-any
-Depends: lsb-base (>= 3.0-6), ${misc:Depends}, ${shlibs:Depends}
+Depends: fuse3, ${misc:Depends}, ${shlibs:Depends}
 Pre-Depends: ${misc:Pre-Depends}
+Breaks: ${runit:Breaks}
 Description: FUSE based filesystem for LXC
  LXCFS provides a FUSE based filesystem to improve the LXC experience
  within the containers.
