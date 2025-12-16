@@ -4,7 +4,7 @@ Upstream-Contact: lxc-devel@lists.linuxcontainers.org
 Source: https://linuxcontainers.org/lxcfs/downloads
 
 Files: *
-Copyright: 2014-2022 Canonical Ltd.
+Copyright: 2014-2023 Canonical Ltd.
 License: LGPL-2.1+
 
 Files: debian/*
@@ -12,6 +12,11 @@ Copyright: 2014-2015 Canonical Ltd.
            2016 Adnan Hodzic <adnan@hodzic.org>
            2016-2017 Evgeni Golov <evgeni@debian.org>
            2018-2022 Pierre-Elliott Bécue <peb@debian.org>
+           2022-2025 Mathias Gibbens
+License: LGPL-2.1+
+
+Files: debian/runit/*
+Copyright: 2025 Martin Steigerwald <martin@lichtvoll.de>
 License: LGPL-2.1+
 
 License: LGPL-2.1+

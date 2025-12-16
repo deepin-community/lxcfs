@@ -5,6 +5,8 @@ Before=lxc.service
 Documentation=man:lxcfs(1)
 
 [Service]
+OOMScoreAdjust=-1000
+ExecStartPre=/bin/mkdir -p {{LXCFSTARGETDIR}}
 ExecStart=/usr/bin/lxcfs {{LXCFSTARGETDIR}}
 KillMode=process
 Restart=on-failure

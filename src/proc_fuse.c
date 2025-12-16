@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/param.h>
+#include <sys/personality.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
@@ -62,6 +63,9 @@ struct memory_stat {
 	uint64_t total_inactive_file;
 	uint64_t total_active_file;
 	uint64_t total_unevictable;
+	uint64_t slab;
+	uint64_t slab_reclaimable;
+	uint64_t slab_unreclaimable;
 };
 
 static off_t get_procfile_size(const char *path)
@@ -79,6 +83,45 @@ static off_t get_procfile_size(const char *path)
 		answer += sz;
 
 	return answer;
+}
+
+static off_t get_procfile_size_with_personality(const char *path)
+{
+	struct fuse_context *fc = fuse_get_context();
+	__u32 host_personality = liblxcfs_personality(), caller_personality;
+	bool change_personality;
+	int ret;
+	off_t procfile_size_ret;
+
+	if (get_task_personality(fc->pid, &caller_personality) < 0)
+		return log_error(0, "Failed to get caller process (pid: %d) personality", fc->pid);
+
+	/* do we need to change thread personality? */
+	change_personality = host_personality != caller_personality;
+
+	if (change_personality) {
+		ret = personality(caller_personality);
+		if (ret == -1)
+			return log_error(0, "Call to personality(%d) failed: %s\n",
+					caller_personality, strerror(errno));
+
+		lxcfs_debug("task (tid: %d) personality was changed %d -> %d\n",
+				(int)syscall(SYS_gettid), ret, caller_personality);
+	}
+
+	procfile_size_ret = get_procfile_size(path);
+
+	if (change_personality) {
+		ret = personality(host_personality);
+		if (ret == -1)
+			return log_error(0, "Call to personality(%d) failed: %s\n",
+					host_personality, strerror(errno));
+
+		lxcfs_debug("task (tid: %d) personality was restored %d -> %d\n",
+				(int)syscall(SYS_gettid), ret, host_personality);
+	}
+
+	return procfile_size_ret;
 }
 
 __lxcfs_fuse_ops int proc_getattr(const char *path, struct stat *sb)
@@ -105,7 +148,13 @@ __lxcfs_fuse_ops int proc_getattr(const char *path, struct stat *sb)
 	    strcmp(path, "/proc/swaps")		== 0 ||
 	    strcmp(path, "/proc/loadavg")	== 0 ||
 	    strcmp(path, "/proc/slabinfo")	== 0) {
-		sb->st_size = get_procfile_size(path);
+		if (liblxcfs_functional()) {
+			if (!can_access_personality())
+				return log_error(-EACCES, RESTRICTED_PERSONALITY_ACCESS_POLICY);
+			sb->st_size = get_procfile_size_with_personality(path);
+		}
+		else
+			sb->st_size = get_procfile_size(path);
 		sb->st_mode = S_IFREG | 00444;
 		sb->st_nlink = 1;
 		return 0;
@@ -118,16 +167,16 @@ __lxcfs_fuse_ops int proc_readdir(const char *path, void *buf,
 				  fuse_fill_dir_t filler, off_t offset,
 				  struct fuse_file_info *fi)
 {
-	if (DIR_FILLER(filler, buf, ".",		NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "..",		NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "cpuinfo",	NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "meminfo",	NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "stat",		NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "uptime",	NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "diskstats",	NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "swaps",	NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "loadavg",	NULL, 0) != 0 ||
-	    DIR_FILLER(filler, buf, "slabinfo",	NULL, 0) != 0)
+	if (dir_filler(filler, buf, ".",		0) != 0 ||
+	    dir_filler(filler, buf, "..",		0) != 0 ||
+	    dir_filler(filler, buf, "cpuinfo",		0) != 0 ||
+	    dir_filler(filler, buf, "meminfo",		0) != 0 ||
+	    dir_filler(filler, buf, "stat",		0) != 0 ||
+	    dir_filler(filler, buf, "uptime",		0) != 0 ||
+	    dir_filler(filler, buf, "diskstats",	0) != 0 ||
+	    dir_filler(filler, buf, "swaps",		0) != 0 ||
+	    dir_filler(filler, buf, "loadavg",		0) != 0 ||
+	    dir_filler(filler, buf, "slabinfo",		0) != 0)
 		return -EINVAL;
 
 	return 0;
@@ -163,7 +212,13 @@ __lxcfs_fuse_ops int proc_open(const char *path, struct fuse_file_info *fi)
 
 	info->type = type;
 
-	info->buflen = get_procfile_size(path) + BUF_RESERVE_SIZE;
+	if (liblxcfs_functional()) {
+		if (!can_access_personality())
+			return log_error(-EACCES, RESTRICTED_PERSONALITY_ACCESS_POLICY);
+		info->buflen = get_procfile_size_with_personality(path) + BUF_RESERVE_SIZE;
+	}
+	else
+		info->buflen = get_procfile_size(path) + BUF_RESERVE_SIZE;
 
 	info->buf = zalloc(info->buflen);
 	if (!info->buf)
@@ -193,21 +248,37 @@ __lxcfs_fuse_ops int proc_release(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static uint64_t get_memlimit(const char *cgroup, bool swap)
+/**
+ * Gets a non-hierarchical memory controller limit, or UINT64_MAX if no limit is
+ * in place. If `swap` is true, reads 'swap' (v2) or 'memsw' (v1); otherwise
+ * reads the memory (RAM) limits.
+ *
+ * @returns 0 on success (and sets `*limit`), < 0 on error
+ */
+static int get_memlimit(const char *cgroup, bool swap, uint64_t *limit)
 {
 	__do_free char *memlimit_str = NULL;
-	uint64_t memlimit = 0;
+	uint64_t memlimit = UINT64_MAX;
 	int ret;
 
 	if (swap)
 		ret = cgroup_ops->get_memory_swap_max(cgroup_ops, cgroup, &memlimit_str);
 	else
 		ret = cgroup_ops->get_memory_max(cgroup_ops, cgroup, &memlimit_str);
-	if (ret > 0 && memlimit_str[0] && safe_uint64(memlimit_str, &memlimit, 10) < 0)
-		lxcfs_error("Failed to convert memory%s.max=%s for cgroup %s",
-			    swap ? ".swap" : "", memlimit_str, cgroup);
 
-	return memlimit;
+	if (ret < 0)
+		return ret;
+
+	if (memlimit_str[0]) {
+		ret = safe_uint64(memlimit_str, &memlimit, 10);
+		if (ret < 0) {
+			lxcfs_error("Failed to convert memory%s.max=%s for cgroup %s",
+				    swap ? ".swap" : "", memlimit_str, cgroup);
+			return ret;
+		}
+	}
+	*limit = memlimit;
+	return 0;
 }
 
 /*
@@ -272,31 +343,44 @@ static char *gnu_dirname(char *path)
 	return path;
 }
 
-static uint64_t get_min_memlimit(const char *cgroup, bool swap)
+/**
+ * Gets a hierarchical memory controller limit, or UINT64_MAX if no limit is
+ * in place. If `swap` is true, reads 'swap' (v2) or 'memsw' (v1); otherwise
+ * reads the memory (RAM) limits.
+ *
+ * @returns 0 on success (and sets `*limit`), < 0 on error
+ */
+static int get_min_memlimit(const char *cgroup, bool swap, uint64_t *limit)
 {
 	__do_free char *copy = NULL;
-	uint64_t memlimit = 0, retlimit = 0;
+	uint64_t memlimit = UINT64_MAX, retlimit = UINT64_MAX;
+	int ret;
 
 	copy = strdup(cgroup);
 	if (!copy)
 		return log_error_errno(0, ENOMEM, "Failed to allocate memory");
 
-	retlimit = get_memlimit(copy, swap);
+	ret = get_memlimit(copy, swap, &retlimit);
+	if (ret < 0)
+		return ret;
 
 	/*
 	 * If the cgroup doesn't start with / (probably won't happen), dirname()
 	 * will terminate with "" instead of "/"
 	 */
-	while (*copy && strcmp(copy, "/") != 0) {
+	while (retlimit != 0 && *copy && strcmp(copy, "/") != 0) {
 		char *it = copy;
 
 		it = gnu_dirname(it);
-		memlimit = get_memlimit(it, swap);
-		if (memlimit > 0 && memlimit < retlimit)
+		ret = get_memlimit(it, swap, &memlimit);
+		if (ret < 0)
+			return ret;
+		if (memlimit < retlimit)
 			retlimit = memlimit;
-	};
+	}
 
-	return retlimit;
+	*limit = retlimit;
+	return 0;
 }
 
 static inline bool startswith(const char *line, const char *pref)
@@ -315,30 +399,30 @@ static void get_swap_info(const char *cgroup, uint64_t memlimit,
 	*swtotal = *swusage = 0;
 	*memswpriority = 1;
 
-	memswlimit = get_min_memlimit(cgroup, true);
-	if (memswlimit > 0) {
-		ret = cgroup_ops->get_memory_swap_current(cgroup_ops, cgroup, &memswusage_str);
-		if (ret < 0 || safe_uint64(memswusage_str, &memswusage, 10) != 0)
-			return;
+	ret = get_min_memlimit(cgroup, true, &memswlimit);
+	if (ret < 0)
+		return;
+	ret = cgroup_ops->get_memory_swap_current(cgroup_ops, cgroup, &memswusage_str);
+	if (ret < 0 || safe_uint64(memswusage_str, &memswusage, 10) < 0)
+		return;
 
-		if (liblxcfs_memory_is_cgroupv2()) {
-			*swtotal = memswlimit / 1024;
-			*swusage = memswusage / 1024;
-		} else {
-			if (memlimit > memswlimit)
-				*swtotal = 0;
-			else
-				*swtotal = (memswlimit - memlimit) / 1024;
-			if (memusage > memswusage || swtotal == 0)
-				*swusage = 0;
-			else
-				*swusage = (memswusage - memusage) / 1024;
-		}
-
-		ret = cgroup_ops->get_memory_swappiness(cgroup_ops, cgroup, &memswpriority_str);
-		if (ret >= 0)
-			safe_uint64(memswpriority_str, memswpriority, 10);
+	if (liblxcfs_memory_is_cgroupv2()) {
+		*swtotal = memswlimit / 1024;
+		*swusage = memswusage / 1024;
+	} else {
+		if (memlimit > memswlimit)
+			*swtotal = 0;
+		else
+			*swtotal = (memswlimit - memlimit) / 1024;
+		if (memusage > memswusage || *swtotal == 0)
+			*swusage = 0;
+		else
+			*swusage = (memswusage - memusage) / 1024;
 	}
+
+	ret = cgroup_ops->get_memory_swappiness(cgroup_ops, cgroup, &memswpriority_str);
+	if (ret >= 0)
+		safe_uint64(memswpriority_str, memswpriority, 10);
 }
 
 static int proc_swaps_read(char *buf, size_t size, off_t offset,
@@ -386,12 +470,12 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 		return read_file_fuse("/proc/swaps", buf, size, d);
 	prune_init_slice(cgroup);
 
-	memlimit = get_min_memlimit(cgroup, false);
-
+	ret = get_min_memlimit(cgroup, false, &memlimit);
+	if (ret < 0)
+		return 0;
 	ret = cgroup_ops->get_memory_current(cgroup_ops, cgroup, &memusage_str);
 	if (ret < 0)
 		return 0;
-
 	if (safe_uint64(memusage_str, &memusage, 10) < 0)
 		lxcfs_error("Failed to convert memusage %s", memusage_str);
 
@@ -413,11 +497,13 @@ static int proc_swaps_read(char *buf, size_t size, off_t offset,
 	}
 
 	if (wants_swap) {
-		/* The total amount of swap is always reported to be the
+		/* For cgroups v1, the total amount of swap is always reported to be the
 		   lesser of the RAM+SWAP limit or the SWAP device size.
 		   This is because the kernel can swap as much as it
 		   wants and not only up to swtotal. */
-		swtotal = memlimit / 1024 + swtotal;
+		if (!liblxcfs_memory_is_cgroupv2())
+			swtotal = memlimit / 1024 + swtotal;
+
 		if (hostswtotal < swtotal) {
 			swtotal = hostswtotal;
 		}
@@ -617,14 +703,14 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 		get_blkio_io_value(io_service_time_str, stats.major, stats.minor, "Total", &stats.total_ticks);
 		stats.total_ticks = stats.total_ticks / 1000000;
 
-		memset(lbuf, 0, 256);
+		memset(lbuf, 0, sizeof(lbuf));
 		if (stats.read || stats.write || stats.read_merged || stats.write_merged ||
 		    stats.read_sectors || stats.write_sectors || stats.read_ticks ||
-		    stats.write_ticks || stats.ios_pgr || stats.total_ticks || stats.rq_ticks ||
-		    stats.discard_merged || stats.discard_sectors || stats.discard_ticks)
-			snprintf(
+		    stats.write_ticks || stats.ios_pgr || stats.total_ticks || stats.rq_ticks || stats.discard ||
+		    stats.discard_merged || stats.discard_sectors || stats.discard_ticks) {
+			ret = strnprintf(
 				lbuf,
-				256,
+				sizeof(lbuf),
 				"%u       %u" /* major, minor */
 				" %s"         /* dev_name */
 				" %" PRIu64   /* read */
@@ -638,6 +724,7 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 				" %" PRIu64   /* ios_pgr */
 				" %" PRIu64   /* total_ticks */
 				" %" PRIu64   /* rq_ticks */
+				" %" PRIu64   /* discard */
 				" %" PRIu64   /* discard_merged */
 				" %" PRIu64   /* discard_sectors */
 				" %" PRIu64   /* discard_ticks */
@@ -656,11 +743,18 @@ static int proc_diskstats_read(char *buf, size_t size, off_t offset,
 				stats.ios_pgr,
 				stats.total_ticks,
 				stats.rq_ticks,
+				stats.discard,
 				stats.discard_merged,
 				stats.discard_sectors,
 				stats.discard_ticks);
-		else
+			if (ret < 0) {
+				lxcfs_error("Insufficient buffer for %u:%u %s diskstats",
+					    stats.major, stats.minor, stats.dev_name);
+				continue;
+			}
+		} else {
 			continue;
+		}
 
 		l = snprintf(cache, cache_size, "%s", lbuf);
 		if (l < 0)
@@ -885,7 +979,7 @@ static int proc_uptime_read(char *buf, size_t size, off_t offset,
 static int proc_stat_read(char *buf, size_t size, off_t offset,
 			  struct fuse_file_info *fi)
 {
-	__do_free char *cg = NULL, *cpuset = NULL, *line = NULL;
+	__do_free char *cg = NULL, *cpu_cg = NULL, *cpuset = NULL, *line = NULL;
 	__do_free void *fopen_cache = NULL;
 	__do_free struct cpuacct_usage *cg_cpu_usage = NULL;
 	__do_fclose FILE *f = NULL;
@@ -938,7 +1032,10 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	if (!cg)
 		return read_file_fuse("/proc/stat", buf, size, d);
 	prune_init_slice(cg);
-
+	cpu_cg = get_pid_cgroup(initpid, "cpu");
+	if (!cpu_cg)
+		return read_file_fuse("/proc/stat", buf, size, d);
+	prune_init_slice(cpu_cg);
 	cpuset = get_cpuset(cg);
 	if (!cpuset)
 		return 0;
@@ -958,7 +1055,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	 */
 	if (read_cpuacct_usage_all(cg, cpuset, &cg_cpu_usage, &cg_cpu_usage_size) == 0) {
 		if (cgroup_ops->can_use_cpuview(cgroup_ops) && opts && opts->use_cfs) {
-			total_len = cpuview_proc_stat(cg, cpuset, cg_cpu_usage,
+			total_len = cpuview_proc_stat(cg, cpu_cg, cpuset, cg_cpu_usage,
 						      cg_cpu_usage_size, f,
 						      d->buf, d->buflen);
 			goto out;
@@ -972,7 +1069,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 		char cpu_char[10]; /* That's a lot of cores */
 		char *c;
 		uint64_t all_used, cg_used, new_idle;
-		int ret;
+		int ret, cpu_to_render;
 
 		if (strlen(line) == 0)
 			continue;
@@ -998,6 +1095,11 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 			continue;
 
 		curcpu++;
+
+		if (cgroup_ops->can_use_cpuview(cgroup_ops) && opts && opts->use_cfs)
+			cpu_to_render = curcpu;
+		else
+			cpu_to_render = physcpu;
 
 		ret = sscanf(
 			   line,
@@ -1027,7 +1129,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 			if (!c)
 				continue;
 
-			l = snprintf(cache, cache_size, "cpu%d%s", curcpu, c);
+			l = snprintf(cache, cache_size, "cpu%d%s", cpu_to_render, c);
 			if (l < 0)
 				return log_error(0, "Failed to write cache");
 			if ((size_t)l >= cache_size)
@@ -1052,13 +1154,13 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 				new_idle = idle + (all_used - cg_used);
 			} else {
 				lxcfs_debug("cpu%d from %s has unexpected cpu time: %" PRIu64 " in /proc/stat, %" PRIu64 " in cpuacct.usage_all; unable to determine idle time",
-					    curcpu, cg, all_used, cg_used);
+					    cpu_to_render, cg, all_used, cg_used);
 				new_idle = idle;
 			}
 
 			l = snprintf(cache, cache_size,
 				     "cpu%d %" PRIu64 " 0 %" PRIu64 " %" PRIu64 " 0 0 0 0 0 0\n",
-				     curcpu, cg_cpu_usage[physcpu].user,
+				     cpu_to_render, cg_cpu_usage[physcpu].user,
 				     cg_cpu_usage[physcpu].system, new_idle);
 			if (l < 0)
 				return log_error(0, "Failed to write cache");
@@ -1091,7 +1193,7 @@ static int proc_stat_read(char *buf, size_t size, off_t offset,
 	int cpuall_len = snprintf(
 			cpuall,
 			CPUALL_MAX_SIZE,
-			"cpu  "
+			"cpu "
 			" %" PRIu64 /* user_sum */
 			" %" PRIu64 /* nice_sum */
 			" %" PRIu64 /* system_sum */
@@ -1194,6 +1296,12 @@ static bool cgroup_parse_memory_stat(const char *cgroup, struct memory_stat *mst
 			sscanf(line, unified ? "active_file %" PRIu64 : "total_active_file %" PRIu64, &(mstat->total_active_file));
 		} else if (startswith(line, unified ? "unevictable" : "total_unevictable")) {
 			sscanf(line, unified ? "unevictable %" PRIu64 : "total_unevictable %" PRIu64, &(mstat->total_unevictable));
+		} else if (unified && startswith(line, "slab ")) {
+			sscanf(line, "slab %" PRIu64, &(mstat->slab));
+		} else if (unified && startswith(line, "slab_reclaimable")) {
+			sscanf(line, "slab_reclaimable %" PRIu64, &(mstat->slab_reclaimable));
+		} else if (unified && startswith(line, "slab_unreclaimable")) {
+			sscanf(line, "slab_unreclaimable %" PRIu64, &(mstat->slab_unreclaimable));
 		}
 	}
 
@@ -1256,8 +1364,9 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 	if (!cgroup_parse_memory_stat(cgroup, &mstat))
 		return read_file_fuse("/proc/meminfo", buf, size, d);
 
-	memlimit = get_min_memlimit(cgroup, false);
-
+	ret = get_min_memlimit(cgroup, false, &memlimit);
+	if (ret < 0)
+		return read_file_fuse("/proc/meminfo", buf, size, d);
 	/*
 	 * Following values are allowed to fail, because swapaccount might be
 	 * turned off for current kernel.
@@ -1289,7 +1398,8 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 			snprintf(lbuf, 100, "MemFree:        %8" PRIu64 " kB\n", memlimit - memusage);
 			printme = lbuf;
 		} else if (startswith(line, "MemAvailable:")) {
-			snprintf(lbuf, 100, "MemAvailable:   %8" PRIu64 " kB\n", memlimit - memusage + mstat.total_cache / 1024);
+			snprintf(lbuf, 100, "MemAvailable:   %8" PRIu64 " kB\n", memlimit - memusage +
+				(mstat.total_active_file + mstat.total_inactive_file + mstat.slab_reclaimable) / 1024);
 			printme = lbuf;
 		} else if (startswith(line, "SwapTotal:")) {
 			if (wants_swap) {
@@ -1297,11 +1407,10 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 
 				sscanf(line + STRLITERALLEN("SwapTotal:"), "%" PRIu64, &hostswtotal);
 
-				/* The total amount of swap is always reported to be the
+				/* In cgroups v1, the total amount of swap is always reported to be the
 				   lesser of the RAM+SWAP limit or the SWAP device size.
 				   This is because the kernel can swap as much as it
 				   wants and not only up to swtotal. */
-
 				if (!liblxcfs_memory_is_cgroupv2())
 					swtotal += memlimit;
 
@@ -1325,7 +1434,7 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 			snprintf(lbuf, 100, "SwapFree:       %8" PRIu64 " kB\n", swfree);
 			printme = lbuf;
 		} else if (startswith(line, "Slab:")) {
-			snprintf(lbuf, 100, "Slab:           %8" PRIu64 " kB\n", (uint64_t)0);
+			snprintf(lbuf, 100, "Slab:           %8" PRIu64 " kB\n", mstat.slab / 1024);
 			printme = lbuf;
 		} else if (startswith(line, "Buffers:")) {
 			snprintf(lbuf, 100, "Buffers:        %8" PRIu64 " kB\n", (uint64_t)0);
@@ -1388,10 +1497,10 @@ static int proc_meminfo_read(char *buf, size_t size, off_t offset,
 				 mstat.total_mapped_file / 1024);
 			printme = lbuf;
 		} else if (startswith(line, "SReclaimable:")) {
-			snprintf(lbuf, 100, "SReclaimable:   %8" PRIu64 " kB\n", (uint64_t)0);
+			snprintf(lbuf, 100, "SReclaimable:   %8" PRIu64 " kB\n", mstat.slab_reclaimable / 1024);
 			printme = lbuf;
 		} else if (startswith(line, "SUnreclaim:")) {
-			snprintf(lbuf, 100, "SUnreclaim:     %8" PRIu64 " kB\n", (uint64_t)0);
+			snprintf(lbuf, 100, "SUnreclaim:     %8" PRIu64 " kB\n", mstat.slab_unreclaimable / 1024);
 			printme = lbuf;
 		} else if (startswith(line, "Shmem:")) {
 			snprintf(lbuf, 100, "Shmem:          %8" PRIu64 " kB\n",
@@ -1500,6 +1609,46 @@ static int proc_slabinfo_read(char *buf, size_t size, off_t offset,
 	return total_len;
 }
 
+static int proc_read_with_personality(int (*do_proc_read)(char *, size_t, off_t,
+			     struct fuse_file_info *), char *buf, size_t size, off_t offset,
+			     struct fuse_file_info *fi)
+{
+	struct fuse_context *fc = fuse_get_context();
+	__u32 host_personality = liblxcfs_personality(), caller_personality;
+	bool change_personality;
+	int ret, read_ret;
+
+	if (get_task_personality(fc->pid, &caller_personality) < 0)
+		return log_error(0, "Failed to get caller process (pid: %d) personality", fc->pid);
+
+	/* do we need to change thread personality? */
+	change_personality = host_personality != caller_personality;
+
+	if (change_personality) {
+		ret = personality(caller_personality);
+		if (ret == -1)
+			return log_error(0, "Call to personality(%d) failed: %s\n",
+				caller_personality, strerror(errno));
+
+		lxcfs_debug("task (tid: %d) personality was changed %d -> %d\n",
+				(int)syscall(SYS_gettid), ret, caller_personality);
+	}
+
+	read_ret = do_proc_read(buf, size, offset, fi);
+
+	if (change_personality) {
+		ret = personality(host_personality);
+		if (ret == -1)
+			return log_error(0, "Call to personality(%d) failed: %s\n",
+				host_personality, strerror(errno));
+
+		lxcfs_debug("task (tid: %d) personality was restored %d -> %d\n",
+				(int)syscall(SYS_gettid), ret, host_personality);
+	}
+
+	return read_ret;
+}
+
 __lxcfs_fuse_ops int proc_read(const char *path, char *buf, size_t size,
 			       off_t offset, struct fuse_file_info *fi)
 {
@@ -1513,8 +1662,11 @@ __lxcfs_fuse_ops int proc_read(const char *path, char *buf, size_t size,
 		return read_file_fuse_with_offset(LXC_TYPE_PROC_MEMINFO_PATH,
 						  buf, size, offset, f);
 	case LXC_TYPE_PROC_CPUINFO:
-		if (liblxcfs_functional())
-			return proc_cpuinfo_read(buf, size, offset, fi);
+		if (liblxcfs_functional()) {
+			if (!can_access_personality())
+				return log_error(-EACCES, RESTRICTED_PERSONALITY_ACCESS_POLICY);
+			return proc_read_with_personality(&proc_cpuinfo_read, buf, size, offset, fi);
+		}
 
 		return read_file_fuse_with_offset(LXC_TYPE_PROC_CPUINFO_PATH,
 						  buf, size, offset, f);

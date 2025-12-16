@@ -1,8 +1,107 @@
-lxcfs (5.0.0-1) UNRELEASED; urgency=medium
+lxcfs (6.0.4-1+deb13u1) trixie; urgency=medium
 
-  * update
+  * d/control:
+    - Add a dependency on fuse3 (Closes: #1114596)
 
- -- pkg-lxc <pkg-lxc-devel@lists.alioth.debian.org>  Wed, 18 May 2022 22:49:32 -0400
+ -- Pierre-Elliott Bécue <peb@debian.org>  Sun, 21 Sep 2025 12:03:40 +0200
+
+lxcfs (6.0.4-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Mathias Gibbens <gibmat@debian.org>  Thu, 03 Apr 2025 23:08:08 +0000
+
+lxcfs (6.0.3-2) unstable; urgency=medium
+
+  [ Martin Steigerwald ]
+  * Runit support for LXCFS (Closes: #1087185)
+
+  [ Mathias Gibbens ]
+  * Update Standards-Version to 4.7.2 in d/control (no changes needed)
+  * Update years in d/copyright
+  * Drop vestigial ${lxcfs:Depends} definition in d/rules that was only
+    used by bin:libpam-cgfs (dropped from src:lxcfs in 3.0.2-1)
+
+ -- Mathias Gibbens <gibmat@debian.org>  Mon, 17 Mar 2025 23:37:36 +0000
+
+lxcfs (6.0.3-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Mathias Gibbens <gibmat@debian.org>  Thu, 19 Dec 2024 23:34:55 +0000
+
+lxcfs (6.0.2-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Mathias Gibbens <gibmat@debian.org>  Wed, 18 Sep 2024 23:54:01 +0000
+
+lxcfs (6.0.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * Update Standards-Version to 4.7.0 in d/control (no changes needed)
+
+ -- Mathias Gibbens <gibmat@debian.org>  Wed, 26 Jun 2024 21:19:02 +0000
+
+lxcfs (6.0.0-1) unstable; urgency=medium
+
+  * New upstream release
+    - Drop patch applied upstream
+  * d/control
+    - Update Build-Depends from systemd -> systemd-dev (Closes: #1060542)
+    - Update Build-Depends from pkg-config -> pkgconf
+  * Update years in d/copyright
+  * Switch default branch to debian/sid
+
+ -- Mathias Gibbens <gibmat@debian.org>  Fri, 29 Mar 2024 17:18:39 +0000
+
+lxcfs (5.0.4-1) unstable; urgency=medium
+
+  * New upstream release
+  * Remove lsb-base from Depends in d/control
+  * Remove workaround for systemd .service file install location in d/rules
+  * Add d/clean to fix failing to build twice in a row (Closes: #1046160)
+  * Cherry-pick upstream fix for /proc/cpuinfo being empty within an arm32
+    container with large numbers of CPUs (Closes: #1036818)
+
+ -- Mathias Gibbens <gibmat@debian.org>  Fri, 15 Sep 2023 20:37:31 +0000
+
+lxcfs (5.0.3-1) unstable; urgency=medium
+
+  [ Mathias Gibbens ]
+  * New upstream release
+  * d/control:
+    - Update my email address
+    - Bump Standards-Version (no changes needed)
+  * Adjust systemd .service file install location in d/rules
+  * Refresh d/copyright
+
+  [ Debian Janitor ]
+  * Remove constraints unnecessary since buster (oldstable):
+    + lxcfs: Drop versioned constraint on lsb-base in Depends.
+    + Remove 1 maintscript entries from 1 files.
+
+ -- Mathias Gibbens <gibmat@debian.org>  Tue, 17 Jan 2023 01:21:28 +0000
+
+lxcfs (5.0.2-1) unstable; urgency=medium
+
+  [ Mathias Gibbens ]
+  * New upstream release 5.0.2
+  * d/control:
+    - Add myself to Uploaders
+    - Bump Standards-Version to 4.6.1 (no changes needed)
+  * d/copyright: Add myself
+  * Add d/salsa-ci.yml
+
+  [ Debian Janitor ]
+  * Set upstream metadata fields: Bug-Database, Bug-Submit, Repository,
+    Repository-Browse.
+  * Avoid explicitly specifying -Wl,--as-needed linker flag.
+
+  [ Pierre-Elliott Bécue ]
+  * d/control: add systemd as a Build-Dependency
+
+ -- Mathias Gibbens <mathias@calenhad.com>  Thu, 29 Sep 2022 21:01:38 +0200
 
 lxcfs (5.0.0-1) unstable; urgency=medium
 

@@ -1,0 +1,5 @@
+#!/bin/sh
+
+fusermount -u /var/lib/lxcfs 2> /dev/null
+
+exec /usr/lib/runit/finish-exec "$@"

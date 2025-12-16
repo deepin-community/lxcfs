@@ -16,6 +16,7 @@
 
 #include "../macro.h"
 #include "../memory_utils.h"
+#include "../utils.h"
 #include "cgroup.h"
 #include "cgroup_utils.h"
 
@@ -75,6 +76,21 @@ bool is_cgroup_fd(int fd)
 
 	if (is_fs_type(&fs, CGROUP2_SUPER_MAGIC) ||
 	    is_fs_type(&fs, CGROUP_SUPER_MAGIC))
+		return true;
+
+	return false;
+}
+
+bool is_cgroup2_fd(int fd)
+{
+	int ret;
+	struct statfs fs;
+
+	ret = fstatfs(fd, &fs);
+	if (ret)
+		return false;
+
+	if (is_fs_type(&fs, CGROUP2_SUPER_MAGIC))
 		return true;
 
 	return false;
@@ -427,32 +443,6 @@ int safe_mount(const char *src, const char *dest, const char *fstype,
 	return 0;
 }
 
-#if !HAVE_STRLCPY
-size_t strlcpy(char *dest, const char *src, size_t size)
-{
-	size_t ret = strlen(src);
-
-	if (size) {
-		size_t len = (ret >= size) ? size - 1 : ret;
-		memcpy(dest, src, len);
-		dest[len] = '\0';
-	}
-
-	return ret;
-}
-#endif
-
-#if !HAVE_STRLCAT
-size_t strlcat(char *d, const char *s, size_t n)
-{
-	size_t l = strnlen(d, n);
-	if (l == n)
-		return l + strlen(s);
-
-	return l + strlcpy(d + l, s, n - l);
-}
-#endif
-
 FILE *fopen_cloexec(const char *path, const char *mode)
 {
 	__do_close int fd = -EBADF;
@@ -766,11 +756,14 @@ int cgroup_walkup_to_root(int cgroup2_root_fd, int hierarchy_fd,
 		return 0;
 	}
 
+	if (!is_cgroup2_fd(dir_fd))
+		return -EINVAL;
+
 	/*
 	 * Legacy cgroup hierarchies should always show a valid value in the
 	 * file of the cgroup. So no need to do this upwards walking crap.
 	 */
-	if (cgroup2_root_fd < 0)
+	if (cgroup2_root_fd < 0 || !is_cgroup2_fd(cgroup2_root_fd))
 		return -EINVAL;
 	else if (same_file(cgroup2_root_fd, dir_fd))
 		return 1;
@@ -790,6 +783,9 @@ int cgroup_walkup_to_root(int cgroup2_root_fd, int hierarchy_fd,
 		dir_fd = openat(inner_fd, "..", O_DIRECTORY | O_PATH | O_CLOEXEC);
 		if (dir_fd < 0)
 			return -errno;
+
+		if (!is_cgroup2_fd(dir_fd))
+			return log_error_errno(-ELOOP, ELOOP, "Found non-cgroup2 directory during cgroup2 tree walkup. Terminating walk");
 
 		/*
 		 * We're at the root of the cgroup2 tree so stop walking

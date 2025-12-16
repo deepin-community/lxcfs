@@ -5,6 +5,7 @@
 
 #include "config.h"
 
+#include <linux/limits.h>
 #include <linux/types.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -23,13 +24,11 @@
 #include "proc_loadavg.h"
 #include "sysfs_fuse.h"
 
-/* directory under which we mount the controllers - /run/lxcfs/controllers */
-#define BASEDIR RUNTIME_PATH "/lxcfs/controllers"
-#define ROOTDIR RUNTIME_PATH "/lxcfs/root"
-
 /* Maximum number for 64 bit integer is a string with 21 digits: 2^64 - 1 = 21 */
 #define LXCFS_NUMSTRLEN64 21
 
+/* The definitions here are well-ordered. New values should go directly
+ * above LXC_TYPE_MAX only. */
 enum lxcfs_virt_t {
 	LXC_TYPE_CGDIR,
 	LXC_TYPE_CGFILE,
@@ -67,7 +66,32 @@ enum lxcfs_virt_t {
 
 	LXC_TYPE_SYS_DEVICES_SYSTEM_CPU_ONLINE,
 #define LXC_TYPE_SYS_DEVICES_SYSTEM_CPU_ONLINE_PATH "/sys/devices/system/cpu/online"
+	LXC_TYPE_MAX,
 };
+
+/* Macros below used to check the class from the file types above */
+#define LXCFS_TYPE_CGROUP(type) (type >= LXC_TYPE_CGDIR && type <= LXC_TYPE_CGFILE)
+#define LXCFS_TYPE_PROC(type) (type >= LXC_TYPE_PROC_MEMINFO && type <= LXC_TYPE_PROC_SLABINFO)
+#define LXCFS_TYPE_SYS(type) (type >= LXC_TYPE_SYS && type <= LXC_TYPE_SYS_DEVICES_SYSTEM_CPU_ONLINE)
+#define LXCFS_TYPE_OK(type) (type >= LXC_TYPE_CGDIR && type < LXC_TYPE_MAX)
+
+/*
+ * This signal will be used to signal fuse request processing thread that
+ * request was interrupted (FUSE_INTERRUPT came from the kernel).
+ *
+ * It's not imporant which signal num is used, but it should not intersect with
+ * any signals those are already handled and used somewhere.
+ * Since, SIGUSR1 and SIGUSR2 are already utilized by lxcfs, let it be SIGTTOU.
+ *
+ * See also:
+ * ("interrupt support")
+ * https://github.com/libfuse/libfuse/commit/288ed4ebcea335c77793ee3d207c7466d55c4f71
+ */
+#define LXCFS_INTR_SIGNAL SIGTTOU
+
+extern int mutex_lock_interruptible(pthread_mutex_t *l);
+extern int rwlock_rdlock_interruptible(pthread_rwlock_t *l);
+extern int rwlock_wrlock_interruptible(pthread_rwlock_t *l);
 
 struct file_info {
 	char *controller;
@@ -89,6 +113,8 @@ struct lxcfs_opts {
 	 * and the use of bool instead of explicited __u32 and __u64 we can't.
 	 */
 	__u32 version;
+        // As of opts version 2.
+        char runtime_path[PATH_MAX];
 };
 
 typedef enum lxcfs_opt_t {
@@ -107,6 +133,7 @@ extern bool liblxcfs_can_use_swap(void);
 extern bool liblxcfs_memory_is_cgroupv2(void);
 extern bool liblxcfs_can_use_sys_cpu(void);
 extern bool liblxcfs_has_versioned_opts(void);
+extern __u32 liblxcfs_personality(void);
 
 static inline bool lxcfs_has_opt(struct lxcfs_opts *opts, lxcfs_opt_t opt)
 {

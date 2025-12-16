@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <libgen.h>
 #include <pthread.h>
 #include <sched.h>
@@ -30,8 +31,13 @@
 #include "lxcfs_fuse_compat.h"
 #include "macro.h"
 #include "memory_utils.h"
+#include "utils.h"
+
+#define PID_FILE "/lxcfs.pid"
 
 void *dlopen_handle;
+static char runtime_path[PATH_MAX] = DEFAULT_RUNTIME_PATH;
+
 
 /* Functions to keep track of number of threads using the library */
 
@@ -65,6 +71,22 @@ static inline void users_unlock(void)
 	unlock_mutex(&user_count_mutex);
 }
 
+/* Returns file info type of custom type declaration carried
+ * in fuse_file_info */
+static inline enum lxcfs_virt_t file_info_type(struct fuse_file_info *fi)
+{
+	struct file_info *f;
+
+	f = INTTYPE_TO_PTR(fi->fh);
+	if (!f)
+		return -1;
+
+	if (!LXCFS_TYPE_OK(f->type))
+		return -1;
+
+	return f->type;
+}
+
 static pthread_t loadavg_pid = 0;
 
 /* Returns zero on success */
@@ -72,12 +94,36 @@ static int start_loadavg(void)
 {
 	char *error;
 	pthread_t (*__load_daemon)(int);
+	int (*__load_daemon_v2)(pthread_t *, int);
 
+	/* try a new load_daemon_v2() API */
+	dlerror();
+	__load_daemon_v2 = (int (*)(pthread_t *, int))dlsym(dlopen_handle, "load_daemon_v2");
+	error = dlerror();
+	if (error)
+		/* try with an old symbol name */
+		goto old_api;
+
+	lxcfs_debug("start_loadavg: using load_daemon_v2");
+
+	if (__load_daemon_v2(&loadavg_pid, 1)) {
+		/* we have to NULLify loadavg_pid as in case of error it's contents are undefined */
+		loadavg_pid = 0;
+		return log_error(-1, "Failed to start loadavg daemon");
+	}
+
+	/* we are done */
+	return 0;
+
+old_api:
+	/* go with an old load_daemon() API */
 	dlerror();
 	__load_daemon = (pthread_t(*)(int))dlsym(dlopen_handle, "load_daemon");
 	error = dlerror();
 	if (error)
 		return log_error(-1, "%s - Failed to start loadavg daemon", error);
+
+	lxcfs_debug("start_loadavg: using load_daemon");
 
 	loadavg_pid = __load_daemon(1);
 	if (!loadavg_pid)
@@ -105,9 +151,25 @@ static int stop_loadavg(void)
 
 static volatile sig_atomic_t need_reload;
 
+static int do_lxcfs_fuse_init(void)
+{
+	char *error;
+	void *(*__lxcfs_fuse_init)(struct fuse_conn_info * conn, void * cfg);
+
+	dlerror();
+	__lxcfs_fuse_init = (void *(*)(struct fuse_conn_info * conn, void * cfg))dlsym(dlopen_handle, "lxcfs_fuse_init");
+	error = dlerror();
+	if (error)
+		return log_error(-1, "%s - Failed to find lxcfs_fuse_init()", error);
+
+	__lxcfs_fuse_init(NULL, NULL);
+
+	return 0;
+}
+
 /* do_reload - reload the dynamic library.  Done under
  * lock and when we know the user_count was 0 */
-static void do_reload(void)
+static void do_reload(bool reinit)
 {
 	int ret;
 	char lxcfs_lib_path[PATH_MAX];
@@ -142,11 +204,15 @@ static void do_reload(void)
 
         dlopen_handle = dlopen(lxcfs_lib_path, RTLD_LAZY);
 	if (!dlopen_handle)
-		log_exit("%s - Failed to open liblxcfs.so", dlerror());
+		log_exit("%s - Failed to open liblxcfs.so at %s", dlerror(), lxcfs_lib_path);
 	else
 		lxcfs_debug("Opened %s", lxcfs_lib_path);
 
 good:
+	if (reinit && do_lxcfs_fuse_init() < 0) {
+		log_exit("Failed to initialize liblxcfs.so");
+	}
+
 	if (loadavg_pid > 0)
 		start_loadavg();
 
@@ -159,7 +225,7 @@ static void up_users(void)
 {
 	users_lock();
 	if (users_count == 0 && need_reload)
-		do_reload();
+		do_reload(true);
 	users_count++;
 	users_unlock();
 }
@@ -599,6 +665,8 @@ static int do_sys_releasedir(const char *path, struct fuse_file_info *fi)
 	return __sys_releasedir(path, fi);
 }
 
+static bool cgroup_is_enabled = false;
+
 #if HAVE_FUSE3
 static int lxcfs_getattr(const char *path, struct stat *sb, struct fuse_file_info *fi)
 #else
@@ -619,7 +687,7 @@ static int lxcfs_getattr(const char *path, struct stat *sb)
 		return 0;
 	}
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_getattr(path, sb);
 		down_users();
@@ -650,7 +718,7 @@ static int lxcfs_opendir(const char *path, struct fuse_file_info *fi)
 	if (strcmp(path, "/") == 0)
 		return 0;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_opendir(path, fi);
 		down_users();
@@ -679,19 +747,22 @@ static int lxcfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 #endif
 {
 	int ret;
+	enum lxcfs_virt_t type;
+
+	type = file_info_type(fi);
 
 	if (strcmp(path, "/") == 0) {
-		if (DIR_FILLER(filler, buf, ".", NULL, 0) != 0 ||
-		    DIR_FILLER(filler, buf, "..", NULL, 0) != 0 ||
-		    DIR_FILLER(filler, buf, "proc", NULL, 0) != 0 ||
-		    DIR_FILLER(filler, buf, "sys", NULL, 0) != 0 ||
-		    DIR_FILLER(filler, buf, "cgroup", NULL, 0) != 0)
+		if (dir_filler(filler, buf, ".", 0) != 0 ||
+		    dir_filler(filler, buf, "..", 0) != 0 ||
+		    dir_filler(filler, buf, "proc", 0) != 0 ||
+		    dir_filler(filler, buf, "sys", 0) != 0 ||
+		    (cgroup_is_enabled && dir_filler(filler, buf, "cgroup", 0) != 0))
 			return -ENOMEM;
 
 		return 0;
 	}
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && LXCFS_TYPE_CGROUP(type)) {
 		up_users();
 		ret = do_cg_readdir(path, buf, filler, offset, fi);
 		down_users();
@@ -705,7 +776,7 @@ static int lxcfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		return ret;
 	}
 
-	if (strncmp(path, "/sys", 4) == 0) {
+	if (LXCFS_TYPE_SYS(type)) {
 		up_users();
 		ret = do_sys_readdir(path, buf, filler, offset, fi);
 		down_users();
@@ -722,7 +793,7 @@ static int lxcfs_access(const char *path, int mode)
 	if (strcmp(path, "/") == 0 && (mode & W_OK) == 0)
 		return 0;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_access(path, mode);
 		down_users();
@@ -749,26 +820,33 @@ static int lxcfs_access(const char *path, int mode)
 static int lxcfs_releasedir(const char *path, struct fuse_file_info *fi)
 {
 	int ret;
+	enum lxcfs_virt_t type;
 
-	if (strcmp(path, "/") == 0)
-		return 0;
+	type = file_info_type(fi);
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (LXCFS_TYPE_CGROUP(type)) {
 		up_users();
 		ret = do_cg_releasedir(path, fi);
 		down_users();
 		return ret;
 	}
 
-	if (strcmp(path, "/proc") == 0)
-		return 0;
-
-	if (strncmp(path, "/sys", 4) == 0) {
+	if (LXCFS_TYPE_SYS(type)) {
 		up_users();
 		ret = do_sys_releasedir(path, fi);
 		down_users();
 		return ret;
 	}
+
+	if (path) {
+		if (strcmp(path, "/") == 0)
+			return 0;
+		if (strcmp(path, "/proc") == 0)
+			return 0;
+	}
+
+	lxcfs_error("unknown file type: path=%s, type=%d, fi->fh=%" PRIu64,
+			path, type, fi->fh);
 
 	return -EINVAL;
 }
@@ -777,7 +855,7 @@ static int lxcfs_open(const char *path, struct fuse_file_info *fi)
 {
 	int ret;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_open(path, fi);
 		down_users();
@@ -805,27 +883,33 @@ static int lxcfs_read(const char *path, char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
 	int ret;
+	enum lxcfs_virt_t type;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	type = file_info_type(fi);
+
+	if (cgroup_is_enabled && LXCFS_TYPE_CGROUP(type)) {
 		up_users();
 		ret = do_cg_read(path, buf, size, offset, fi);
 		down_users();
 		return ret;
 	}
 
-	if (strncmp(path, "/proc", 5) == 0) {
+	if (LXCFS_TYPE_PROC(type)) {
 		up_users();
 		ret = do_proc_read(path, buf, size, offset, fi);
 		down_users();
 		return ret;
 	}
 
-	if (strncmp(path, "/sys", 4) == 0) {
+	if (LXCFS_TYPE_SYS(type)) {
 		up_users();
 		ret = do_sys_read(path, buf, size, offset, fi);
 		down_users();
 		return ret;
 	}
+
+	lxcfs_error("unknown file type: path=%s, type=%d, fi->fh=%" PRIu64,
+		path, type, fi->fh);
 
 	return -EINVAL;
 }
@@ -834,15 +918,18 @@ int lxcfs_write(const char *path, const char *buf, size_t size, off_t offset,
 		struct fuse_file_info *fi)
 {
 	int ret;
+	enum lxcfs_virt_t type;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	type = file_info_type(fi);
+
+	if (cgroup_is_enabled && LXCFS_TYPE_CGROUP(type)) {
 		up_users();
 		ret = do_cg_write(path, buf, size, offset, fi);
 		down_users();
 		return ret;
 	}
 
-	if (strncmp(path, "/sys", 4) == 0) {
+	if (LXCFS_TYPE_SYS(type)) {
 		up_users();
 		ret = do_sys_write(path, buf, size, offset, fi);
 		down_users();
@@ -874,27 +961,33 @@ static int lxcfs_flush(const char *path, struct fuse_file_info *fi)
 static int lxcfs_release(const char *path, struct fuse_file_info *fi)
 {
 	int ret;
+	enum lxcfs_virt_t type;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	type = file_info_type(fi);
+
+	if (LXCFS_TYPE_CGROUP(type)) {
 		up_users();
 		ret = do_cg_release(path, fi);
 		down_users();
 		return ret;
 	}
 
-	if (strncmp(path, "/proc", 5) == 0) {
+	if (LXCFS_TYPE_PROC(type)) {
 		up_users();
 		ret = do_proc_release(path, fi);
 		down_users();
 		return ret;
 	}
 
-	if (strncmp(path, "/sys", 4) == 0) {
+	if (LXCFS_TYPE_SYS(type)) {
 		up_users();
 		ret = do_sys_release(path, fi);
 		down_users();
 		return ret;
 	}
+
+	lxcfs_error("unknown file type: path=%s, type=%d, fi->fh=%" PRIu64,
+			path, type, fi->fh);
 
 	return -EINVAL;
 }
@@ -908,7 +1001,7 @@ int lxcfs_mkdir(const char *path, mode_t mode)
 {
 	int ret;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_mkdir(path, mode);
 		down_users();
@@ -926,7 +1019,7 @@ int lxcfs_chown(const char *path, uid_t uid, gid_t gid)
 {
 	int ret;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_chown(path, uid, gid);
 		down_users();
@@ -953,7 +1046,7 @@ int lxcfs_truncate(const char *path, off_t newsize, struct fuse_file_info *fi)
 int lxcfs_truncate(const char *path, off_t newsize)
 #endif
 {
-	if (strncmp(path, "/cgroup", 7) == 0)
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0)
 		return 0;
 
 	if (strncmp(path, "/sys", 4) == 0)
@@ -966,7 +1059,7 @@ int lxcfs_rmdir(const char *path)
 {
 	int ret;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_rmdir(path);
 		down_users();
@@ -984,7 +1077,7 @@ int lxcfs_chmod(const char *path, mode_t mode)
 {
 	int ret;
 
-	if (strncmp(path, "/cgroup", 7) == 0) {
+	if (cgroup_is_enabled && strncmp(path, "/cgroup", 7) == 0) {
 		up_users();
 		ret = do_cg_chmod(path, mode);
 		down_users();
@@ -1001,21 +1094,57 @@ int lxcfs_chmod(const char *path, mode_t mode)
 }
 
 #if HAVE_FUSE3
+static void fuse_intr_sighandler(int sig)
+{
+	(void) sig;
+	/* Nothing to do */
+}
+
+static int fuse_init_intr_signal(int signum)
+{
+	struct sigaction old_sa;
+	struct sigaction sa;
+
+	if (sigaction(signum, NULL, &old_sa) == -1)
+		return log_error(-1, "cannot get old signal handler\n");
+
+	if (old_sa.sa_handler != SIG_DFL)
+		return log_error(-1, "%d has non-default handler\n", signum);
+
+	memset(&sa, 0, sizeof(struct sigaction));
+
+	/*
+	 * We *must* enable SA_RESTART, otherwise we may accidentally
+	 * break some code which is not ready to signals/fuse interrupt.
+	 */
+	sa.sa_flags = SA_RESTART;
+
+	sa.sa_handler = fuse_intr_sighandler;
+	sigemptyset(&sa.sa_mask);
+
+	if (sigaction(signum, &sa, NULL) == -1)
+		return log_error(-1, "cannot set interrupt signal handler\n");
+
+	return 0;
+}
+#endif
+
+#if HAVE_FUSE3
 static void *lxcfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 #else
 static void *lxcfs_init(struct fuse_conn_info *conn)
 #endif
 {
-	char *error;
-	void *(*__lxcfs_fuse_init)(struct fuse_conn_info * conn, void * cfg);
+	if (do_lxcfs_fuse_init() < 0)
+		return NULL;
 
-	dlerror();
-	__lxcfs_fuse_init = (void *(*)(struct fuse_conn_info * conn, void * cfg))dlsym(dlopen_handle, "lxcfs_fuse_init");
-	error = dlerror();
-	if (error)
-		return log_error(NULL, "%s - Failed to find lxcfs_fuse_init()", error);
+#if HAVE_FUSE3
+	cfg->direct_io = 1;
+	cfg->intr = 1;
+	cfg->intr_signal = LXCFS_INTR_SIGNAL;
+#endif
 
-	return __lxcfs_fuse_init(conn, NULL);
+	return fuse_get_context()->private_data;
 }
 
 const struct fuse_operations lxcfs_ops = {
@@ -1070,15 +1199,18 @@ static void usage(void)
 	lxcfs_info("Options :");
 	lxcfs_info("  -d, --debug          Run lxcfs with debugging enabled");
 	lxcfs_info("  -f, --foreground     Run lxcfs in the foreground");
-	lxcfs_info("  -n, --help           Print help");
+	lxcfs_info("  -h, --help           Print help");
 	lxcfs_info("  -l, --enable-loadavg Enable loadavg virtualization");
 	lxcfs_info("  -o                   Options to pass directly through fuse");
 	lxcfs_info("  -p, --pidfile=FILE   Path to use for storing lxcfs pid");
-	lxcfs_info("                       Default pidfile is %s/lxcfs.pid", RUNTIME_PATH);
+	lxcfs_info("                       Default pidfile is %s/lxcfs.pid", DEFAULT_RUNTIME_PATH);
 	lxcfs_info("  -u, --disable-swap   Disable swap virtualization");
 	lxcfs_info("  -v, --version        Print lxcfs version");
 	lxcfs_info("  --enable-cfs         Enable CPU virtualization via CPU shares");
 	lxcfs_info("  --enable-pidfd       Use pidfd for process tracking");
+	lxcfs_info("  --enable-cgroup      Enable cgroup emulation code");
+	lxcfs_info("  --runtime-dir=DIR    Path to use as the runtime directory.");
+	lxcfs_info("                       Default is %s", DEFAULT_RUNTIME_PATH);
 	exit(EXIT_FAILURE);
 }
 
@@ -1127,8 +1259,10 @@ static const struct option long_options[] = {
 
 	{"enable-cfs",		no_argument,		0,	  0	},
 	{"enable-pidfd",	no_argument,		0,	  0	},
+	{"enable-cgroup",	no_argument,		0,	  0	},
 
 	{"pidfile",		required_argument,	0,	'p'	},
+	{"runtime-dir",		required_argument,	0,	  0	},
 	{								},
 };
 
@@ -1171,7 +1305,7 @@ int main(int argc, char *argv[])
 	int pidfile_fd = -EBADF;
 	int ret = EXIT_FAILURE;
 	char *pidfile = NULL, *token = NULL;
-	char pidfile_buf[STRLITERALLEN(RUNTIME_PATH) + STRLITERALLEN("/lxcfs.pid") + 1] = {};
+	char pidfile_buf[PATH_MAX + sizeof(PID_FILE)] = {};
 	bool debug = false, foreground = false;
 #if !HAVE_FUSE3
 	bool nonempty = false;
@@ -1188,6 +1322,7 @@ int main(int argc, char *argv[])
 	char *new_fuse_opts = NULL;
 	char *const *new_argv;
 	struct lxcfs_opts *opts;
+	char *runtime_path_arg = NULL;
 
 	opts = malloc(sizeof(struct lxcfs_opts));
 	if (opts == NULL) {
@@ -1198,7 +1333,7 @@ int main(int argc, char *argv[])
 	opts->swap_off = false;
 	opts->use_pidfd = false;
 	opts->use_cfs = false;
-	opts->version = 1;
+	opts->version = 2;
 
 	while ((c = getopt_long(argc, argv, "dulfhvso:p:", long_options, &idx)) != -1) {
 		switch (c) {
@@ -1207,6 +1342,10 @@ int main(int argc, char *argv[])
 				opts->use_pidfd = true;
 			else if (strcmp(long_options[idx].name, "enable-cfs") == 0)
 				opts->use_cfs = true;
+			else if (strcmp(long_options[idx].name, "enable-cgroup") == 0)
+				cgroup_is_enabled = true;
+			else if (strcmp(long_options[idx].name, "runtime-dir") == 0)
+				runtime_path_arg = optarg;
 			else
 				usage();
 			break;
@@ -1258,6 +1397,12 @@ int main(int argc, char *argv[])
 		lxcfs_error("Missing mountpoint");
 		goto out;
 	}
+
+	if (runtime_path_arg) {
+		strlcpy(runtime_path, runtime_path_arg, sizeof(runtime_path));
+		lxcfs_info("runtime path set to %s", runtime_path);
+	}
+	strlcpy(opts->runtime_path, runtime_path, sizeof(opts->runtime_path));
 
 	fuse_argv[fuse_argc++] = argv[0];
 	if (debug)
@@ -1328,7 +1473,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (append_comma_separate(&new_fuse_opts, "direct_io")) {
-		lxcfs_error("Failed to copy fuse argument \"nonempty\"");
+		lxcfs_error("Failed to copy fuse argument \"direct_io\"");
 		goto out;
 	}
 #endif
@@ -1347,14 +1492,24 @@ int main(int argc, char *argv[])
 	fuse_argv[fuse_argc++] = new_argv[0];
 	fuse_argv[fuse_argc] = NULL;
 
-	do_reload();
+	lxcfs_info("Starting LXCFS at %s", argv[0]);
+
+	do_reload(false);
+
 	if (install_signal_handler(SIGUSR1, sigusr1_reload)) {
 		lxcfs_error("%s - Failed to install SIGUSR1 signal handler", strerror(errno));
 		goto out;
 	}
 
+#if HAVE_FUSE3
+	if (fuse_init_intr_signal(LXCFS_INTR_SIGNAL)) {
+		lxcfs_error("Failed to install fuse interrupt signal handler");
+		goto out;
+	}
+#endif
+
 	if (!pidfile) {
-		snprintf(pidfile_buf, sizeof(pidfile_buf), "%s/lxcfs.pid", RUNTIME_PATH);
+		snprintf(pidfile_buf, sizeof(pidfile_buf), "%s%s", runtime_path, PID_FILE);
 		pidfile = pidfile_buf;
 	}
 

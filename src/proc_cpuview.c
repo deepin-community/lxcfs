@@ -171,6 +171,7 @@ static struct cg_proc_stat *add_proc_stat_node(struct cg_proc_stat *new_node)
 	}
 
 out_rwlock_unlock:
+	pthread_mutex_lock(&rv->lock);
 	pthread_rwlock_unlock(&head->lock);
 	return move_ptr(rv);
 }
@@ -224,6 +225,7 @@ static bool cgroup_supports(const char *controller, const char *cgroup,
 	return faccessat(cfd, path, F_OK, 0) == 0;
 }
 
+/* should be called with wr-locked list */
 static struct cg_proc_stat *prune_proc_stat_list(struct cg_proc_stat *node)
 {
 	struct cg_proc_stat *first = NULL;
@@ -232,16 +234,42 @@ static struct cg_proc_stat *prune_proc_stat_list(struct cg_proc_stat *node)
 		if (!cgroup_supports("cpu", node->cg, "cpu.shares")) {
 			struct cg_proc_stat *cur = node;
 
+			/*
+			 * We need to ensure that no one referenced this node,
+			 * because we are going to remove it from the list and free memory.
+			 *
+			 * If we can't grab the lock then just keep this node for now.
+			 */
+			if (pthread_mutex_trylock(&cur->lock))
+				goto next;
+
+			/*
+			 * Yes, we can put lock back just after taking it, as we ensured
+			 * that we are only one user of it right now.
+			 *
+			 * It follows from three facts:
+			 * - we are under pthread_rwlock_wrlock(hash_table_bucket)
+			 * - pthread_mutex_lock is taken by find_proc_stat_node()
+			 * with pthread_rwlock_rdlock(hash_table_bucket) held.
+			 * - pthread_mutex_lock is taken by add_proc_stat_node()
+			 * with pthread_rwlock_wrlock(hash_table_bucket) held.
+			 *
+			 * It means that nobody can get a pointer to (cur) node in a parallel
+			 * thread and all old users of (cur) node have released pthread_mutex_lock(cur).
+			 */
+			pthread_mutex_unlock(&cur->lock);
+
 			if (prev)
 				prev->next = node->next;
 			else
 				first = node->next;
 
 			node = node->next;
-			lxcfs_debug("Removing stat node for %s\n", cur);
+			lxcfs_debug("Removing stat node for %s\n", cur->cg);
 
 			free_proc_stat_node(cur);
 		} else {
+next:
 			if (!first)
 				first = node;
 			prev = node;
@@ -258,7 +286,8 @@ static void prune_proc_stat_history(void)
 	time_t now = time(NULL);
 
 	for (int i = 0; i < CPUVIEW_HASH_SIZE; i++) {
-		pthread_rwlock_wrlock(&proc_stat_history[i]->lock);
+		if (rwlock_wrlock_interruptible(&proc_stat_history[i]->lock))
+			continue;
 
 		if ((proc_stat_history[i]->lastcheck + PROC_STAT_PRUNE_INTERVAL) > now) {
 			pthread_rwlock_unlock(&proc_stat_history[i]->lock);
@@ -279,7 +308,9 @@ static struct cg_proc_stat *find_proc_stat_node(struct cg_proc_stat_head *head,
 {
 	struct cg_proc_stat *node;
 
-	pthread_rwlock_rdlock(&head->lock);
+	prune_proc_stat_history();
+	if (rwlock_rdlock_interruptible(&head->lock))
+		return NULL;
 
 	if (!head->next) {
 		pthread_rwlock_unlock(&head->lock);
@@ -289,15 +320,22 @@ static struct cg_proc_stat *find_proc_stat_node(struct cg_proc_stat_head *head,
 	node = head->next;
 
 	do {
-		if (strcmp(cg, node->cg) == 0)
+		if (strcmp(cg, node->cg) == 0) {
+			/*
+			 * If we are failed to take a lock OR
+			 * fuse request was interrupted then
+			 * just return NULL and exit gracefully.
+			 */
+			if (mutex_lock_interruptible(&node->lock))
+				node = NULL;
 			goto out;
+		}
 	} while ((node = node->next));
 
 	node = NULL;
 
 out:
 	pthread_rwlock_unlock(&head->lock);
-	prune_proc_stat_history();
 	return node;
 }
 
@@ -310,6 +348,10 @@ static struct cg_proc_stat *find_or_create_proc_stat_node(struct cpuacct_usage *
 
 	node = find_proc_stat_node(head, cg);
 	if (!node) {
+		/* safe place to exit */
+		if (fuse_interrupted())
+			return NULL;
+
 		node = new_proc_stat_node(usage, cpu_count, cg);
 		if (!node)
 			return NULL;
@@ -317,8 +359,6 @@ static struct cg_proc_stat *find_or_create_proc_stat_node(struct cpuacct_usage *
 		node = add_proc_stat_node(node);
 		lxcfs_debug("New stat node (%d) for %s\n", cpu_count, cg);
 	}
-
-	pthread_mutex_lock(&node->lock);
 
 	/*
 	 * If additional CPUs on the host have been enabled, CPU usage counter
@@ -466,22 +506,22 @@ static bool cfs_quota_disabled(const char *cg)
 
 /*
  * Return the maximum number of visible CPUs based on CPU quotas.
- * If there is no quota set, zero is returned.
+ * If there is no quota set, cpu number in cpuset value is returned.
  */
-int max_cpu_count(const char *cg)
+int max_cpu_count(const char *cpuset_cg, const char *cpu_cg)
 {
 	__do_free char *cpuset = NULL;
 	int rv, nprocs;
 	int64_t cfs_quota, cfs_period;
 	int nr_cpus_in_cpuset = 0;
 
-	if (!read_cpu_cfs_param(cg, "quota", &cfs_quota))
-		return 0;
+	if (!read_cpu_cfs_param(cpu_cg, "quota", &cfs_quota))
+		cfs_quota = 0;
 
-	if (!read_cpu_cfs_param(cg, "period", &cfs_period))
-		return 0;
+	if (!read_cpu_cfs_param(cpu_cg, "period", &cfs_period))
+		cfs_period = 0;
 
-	cpuset = get_cpuset(cg);
+	cpuset = get_cpuset(cpuset_cg);
 	if (cpuset)
 		nr_cpus_in_cpuset = cpu_number_in_cpuset(cpuset);
 
@@ -512,7 +552,7 @@ int max_cpu_count(const char *cg)
 	return rv;
 }
 
-int cpuview_proc_stat(const char *cg, const char *cpuset,
+int cpuview_proc_stat(const char *cg, const char *cpu_cg, const char *cpuset,
 		      struct cpuacct_usage *cg_cpu_usage, int cg_cpu_usage_size,
 		      FILE *f, char *buf, size_t buf_size)
 {
@@ -600,7 +640,7 @@ int cpuview_proc_stat(const char *cg, const char *cpuset,
 	}
 
 	/* Cannot use more CPUs than is available in cpuset. */
-	max_cpus = max_cpu_count(cg);
+	max_cpus = max_cpu_count(cg, cpu_cg);
 	if (max_cpus > cpu_cnt || !max_cpus)
 		max_cpus = cpu_cnt;
 
@@ -908,7 +948,7 @@ static inline bool cpuline_in_cpuset(const char *line, const char *cpuset)
 int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
-	__do_free char *cg = NULL, *cpuset = NULL, *line = NULL;
+	__do_free char *cg = NULL, *cpuset = NULL, *line = NULL, *cpu_cg = NULL;
 	__do_free void *fopen_cache = NULL;
 	__do_fclose FILE *f = NULL;
 	struct fuse_context *fc = fuse_get_context();
@@ -945,7 +985,10 @@ int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 	if (!cg)
 		return read_file_fuse("proc/cpuinfo", buf, size, d);
 	prune_init_slice(cg);
-
+	cpu_cg = get_pid_cgroup(initpid, "cpu");
+	if (!cpu_cg)
+		return read_file_fuse("proc/cpuinfo", buf, size, d);
+	prune_init_slice(cpu_cg);
 	cpuset = get_cpuset(cg);
 	if (!cpuset)
 		return 0;
@@ -955,7 +998,7 @@ int proc_cpuinfo_read(char *buf, size_t size, off_t offset,
 	else
 		use_view = false;
 	if (use_view)
-		max_cpus = max_cpu_count(cg);
+		max_cpus = max_cpu_count(cg, cpu_cg);
 
 	f = fopen_cached("/proc/cpuinfo", "re", &fopen_cache);
 	if (!f)

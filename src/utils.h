@@ -25,6 +25,8 @@
 #define SEND_CREDS_NOTSK 1
 #define SEND_CREDS_FAIL 2
 
+#define RESTRICTED_PERSONALITY_ACCESS_POLICY "Due to restricted personality access policy, reading proc files from containers is not permitted"
+
 struct file_info;
 
 __attribute__((__format__(__printf__, 4, 5))) extern char *must_strcat(char **src, size_t *sz, size_t *asz, const char *format, ...);
@@ -59,8 +61,10 @@ static inline int pidfd_send_signal(int pidfd, int sig, siginfo_t *info,
 extern FILE *fopen_cached(const char *path, const char *mode,
 			  void **caller_freed_buffer);
 extern FILE *fdopen_cached(int fd, const char *mode, void **caller_freed_buffer);
+extern DIR *opendir_flags(const char *path, int oflags);
 extern ssize_t write_nointr(int fd, const void *buf, size_t count);
 extern int safe_uint64(const char *numstr, uint64_t *converted, int base);
+extern int safe_uint32(const char *numstr, uint32_t *converted, int base);
 extern char *trim_whitespace_in_place(char *buffer);
 
 static inline bool file_exists(const char *f)
@@ -73,5 +77,17 @@ static inline bool file_exists(const char *f)
 #define PROTECT_OPEN_WITH_TRAILING_SYMLINKS (O_CLOEXEC | O_NOCTTY | O_RDONLY)
 #define PROTECT_OPEN (PROTECT_OPEN_WITH_TRAILING_SYMLINKS | O_NOFOLLOW)
 extern char *read_file_at(int dfd, const char *fnam, unsigned int o_flags);
+
+extern int get_task_personality(pid_t pid, __u32 *personality);
+extern bool can_access_personality(void);
+extern int get_host_personality(__u32 *personality);
+
+#if !HAVE_STRLCPY
+extern size_t strlcpy(char *, const char *, size_t);
+#endif
+
+#if !HAVE_STRLCAT
+extern size_t strlcat(char *d, const char *s, size_t n);
+#endif
 
 #endif /* __LXCFS_UTILS_H */

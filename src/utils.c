@@ -33,14 +33,6 @@
  * format: string format. See printf for details.
  * ...: varargs. See printf for details.
  */
-/*
- * append the given formatted string to *src.
- * src: a pointer to a char* in which to append the formatted string.
- * sz: the number of characters printed so far, minus trailing \0.
- * asz: the allocated size so far
- * format: string format. See printf for details.
- * ...: varargs. See printf for details.
- */
 char *must_strcat(char **src, size_t *sz, size_t *asz, const char *format, ...)
 {
 	char tmp[BUF_RESERVE_SIZE];
@@ -172,7 +164,8 @@ bool wait_for_sock(int sock, int timeout)
 {
 	__do_close int epfd = -EBADF;
 	struct epoll_event ev;
-	int ret, now, starttime, deltatime;
+	int ret;
+	time_t now, starttime, deltatime;
 
 	if ((starttime = time(NULL)) < 0)
 		return false;
@@ -537,6 +530,29 @@ int safe_uint64(const char *numstr, uint64_t *converted, int base)
 	return 0;
 }
 
+int safe_uint32(const char *numstr, uint32_t *converted, int base)
+{
+	char *err = NULL;
+	unsigned long uli;
+
+	while (isspace(*numstr))
+		numstr++;
+
+	if (*numstr == '-')
+		return -EINVAL;
+
+	errno = 0;
+	uli = strtoul(numstr, &err, base);
+	if (errno == ERANGE && uli == UINT32_MAX)
+		return -ERANGE;
+
+	if (err == numstr || *err != '\0')
+		return -EINVAL;
+
+	*converted = (uint32_t)uli;
+	return 0;
+}
+
 static int char_left_gc(const char *buffer, size_t len)
 {
 	size_t i;
@@ -634,3 +650,93 @@ char *read_file_at(int dfd, const char *fnam, unsigned int o_flags)
 
 	return move_ptr(buf);
 }
+
+DIR *opendir_flags(const char *path, int flags)
+{
+	__do_close int dfd = -EBADF;
+	DIR *dirp;
+
+	dfd = open(path, O_DIRECTORY | flags);
+	if (dfd < 0)
+		return NULL;
+
+	dirp = fdopendir(dfd);
+	if (dirp)
+		move_fd(dfd); /* Transfer ownership to fdopendir(). */
+
+	return dirp;
+}
+
+int get_task_personality(pid_t pid, __u32 *personality)
+{
+	__do_close int fd = -EBADF;
+	int ret = -1;
+	char path[STRLITERALLEN("/proc//personality") + INTTYPE_TO_STRLEN(pid_t) + 1];
+	/* seq_printf(m, "%08x\n", task->personality); */
+	char buf[8 + 1];
+
+	ret = strnprintf(path, sizeof(path), "/proc/%d/personality", pid);
+	if (ret < 0)
+		return -1;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	ret = read_nointr(fd, buf, sizeof(buf) - 1);
+	if (ret >= 0) {
+		buf[ret] = '\0';
+		if (personality != NULL && safe_uint32(buf, personality, 16) < 0)
+			return log_error(-1, "Failed to convert personality %s", buf);
+	}
+
+	return ret;
+}
+
+/*
+	This function checks whether system security policy (i.e. Yama LSM) allows personality access, by trying on
+	init own one.
+	This is required as it may be restricted by a ptrace access mode check (see PROC(5)), and
+	`get_task_personality` function relies on this.
+*/
+bool can_access_personality(void)
+{
+	static int could_access_init_personality = -1;
+
+	/* init personality has never been accessed (cache is empty) */
+	if (could_access_init_personality == -1) {
+		if (get_task_personality(1, NULL) < 0) {
+			could_access_init_personality = 0;
+		} else {
+			could_access_init_personality = 1;
+		}
+	}
+
+	return could_access_init_personality != 0;
+}
+
+#if !HAVE_STRLCPY
+size_t strlcpy(char *dest, const char *src, size_t size)
+{
+	size_t ret = strlen(src);
+
+	if (size) {
+		size_t len = (ret >= size) ? size - 1 : ret;
+		memcpy(dest, src, len);
+		dest[len] = '\0';
+	}
+
+	return ret;
+}
+#endif
+
+#if !HAVE_STRLCAT
+size_t strlcat(char *d, const char *s, size_t n)
+{
+	size_t l = strnlen(d, n);
+	if (l == n)
+		return l + strlen(s);
+
+	return l + strlcpy(d + l, s, n - l);
+}
+#endif
